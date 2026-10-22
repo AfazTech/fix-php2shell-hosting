@@ -25,14 +25,15 @@ FAILED=()
 # Restarts needed because we changed something
 RESTART_WEB=0
 RESTART_CPSRVD=0
-RESTART_DA=0
 RESTART_CSF=0
 
 # Restarts only suggested because the step was already applied earlier
 SUGGEST_WEB=0
 SUGGEST_CPSRVD=0
-SUGGEST_DA=0
-SUGGEST_CSF=0
+
+# PHP-FPM restart state (asked at the very end)
+PHPFPM_CHANGED=0
+PHPFPM_SUGGEST=0
 
 WEB_RESTARTED=0
 MODSEC_INCLUDE_FILE=""
@@ -403,10 +404,10 @@ step_roundcube_open() {
 }
 
 # =====================================================
-# DirectAdmin: close the panel port in CSF
+# DirectAdmin: check the panel port in CSF (open it if closed)
 # =====================================================
 step_csf_da_port() {
-    header "Close DirectAdmin port in CSF (TCP_IN)"
+    header "Check DirectAdmin port in CSF (TCP_IN)"
     local csf_conf="/etc/csf/csf.conf"
     local da_conf="/usr/local/directadmin/conf/directadmin.conf"
     if [[ ! -f "$csf_conf" ]]; then
@@ -427,17 +428,16 @@ step_csf_da_port() {
         FAILED+=("CSF (TCP_IN not found)"); return
     fi
     list="$(sed -E 's/^[^"]*"([^"]*)".*/\1/' <<<"$line" | tr -d ' ')"
-    if ! grep -q ",${da_port}," <<<",${list},"; then
-        ok "Already done: port ${da_port} is not in TCP_IN."
-        ALREADY+=("Port ${da_port} already absent from TCP_IN in CSF")
-        SUGGEST_CSF=1
-        SUGGEST_DA=1
+    if grep -q ",${da_port}," <<<",${list},"; then
+        ok "DirectAdmin port ${da_port} is open in TCP_IN. Nothing to do."
+        ALREADY+=("DirectAdmin port ${da_port} already open in CSF TCP_IN")
         return
     fi
 
-    reason "DirectAdmin, phpMyAdmin and Roundcube are all written in PHP. Closing the DirectAdmin port removes public access to all three at once, so no separate steps are needed. Make sure you still have another way in (allowed IP / SSH)."
-    if ! ask "Remove the DirectAdmin port from TCP_IN?"; then
-        SKIPPED+=("Close DirectAdmin port in CSF"); return
+    warn "DirectAdmin port ${da_port} is NOT in TCP_IN (the panel is closed to the public)."
+    reason "Opening the port makes DirectAdmin (and the PHP apps behind it) reachable from the internet again. Open it only if the server is updated and you want public access; if you reach the panel through an allowed IP in csf.allow, you can skip."
+    if ! ask "Open DirectAdmin port ${da_port} (add it to TCP_IN)?"; then
+        SKIPPED+=("Open DirectAdmin port in CSF"); return
     fi
     if ! command -v python3 >/dev/null 2>&1; then
         warn "python3 not found."
@@ -459,7 +459,8 @@ pattern = re.compile(r'^(TCP_IN\s*=\s*")([^"]*)(".*)$', re.M)
 
 def update(m):
     ports = [p.strip() for p in m.group(2).split(",") if p.strip()]
-    ports = [p for p in ports if p != port]
+    if port not in ports:
+        ports.append(port)
     return m.group(1) + ",".join(ports) + m.group(3)
 
 updated, count = pattern.subn(update, content, count=1)
@@ -472,9 +473,8 @@ PY
         FAILED+=("CSF (update failed)"); return
     fi
     grep '^TCP_IN[[:space:]]*=' "$csf_conf" || true
-    DONE+=("Port ${da_port} removed from TCP_IN in CSF")
+    DONE+=("Port ${da_port} added to TCP_IN in CSF")
     RESTART_CSF=1
-    RESTART_DA=1
 }
 
 # =====================================================
@@ -580,6 +580,15 @@ modsec_rollback() {
     fi
 }
 
+# Lists files (one per line) in system ModSecurity config paths that contain our rule ID
+modsec_rule_files() {
+    grep -RlsE --include='*.conf' --include='*.rules' \
+        --exclude='*.bak.*' \
+        "id:[[:space:]]*['\"]?${RULE_ID}(['\",[:space:]]|\$)" \
+        /etc/httpd/conf /etc/apache2/conf.d /etc/modsecurity.d /etc/custom_modsecurity.d \
+        /usr/local/directadmin/data/admin 2>/dev/null
+}
+
 step_modsec() {
     header "Final check: ModSecurity rule (php_session_upload_progress)"
 
@@ -606,26 +615,30 @@ step_modsec() {
     [[ "$USE_INCLUDE" -eq 1 ]] && MODSEC_INCLUDE_FILE="$include_file"
     info "Rule file: ${RULE_FILE}"
 
-    # ---- Check whether the rule ID already exists in system-level configs ----
-    local module_ok=0 rule_ok=0 include_ok=1
+    # ---- Where does the rule ID already exist? ----
+    local module_ok=0 include_ok=1 files="" others="" in_ours=0
     if [[ "$WEBSERVER" == "LiteSpeed" ]] || modsec_loaded; then module_ok=1; fi
-    if grep -RqsE --include='*.conf' --include='*.rules' \
-        --exclude='*.bak.*' \
-        "id:[[:space:]]*['\"]?${RULE_ID}(['\",[:space:]]|$)" \
-        /etc/httpd/conf /etc/apache2/conf.d /etc/modsecurity.d /etc/custom_modsecurity.d \
-        /usr/local/directadmin/data/admin 2>/dev/null; then
-        rule_ok=1
-    fi
+    files="$(modsec_rule_files || true)"
+    others="$(grep -vxF "$RULE_FILE" <<<"$files" || true)"
+    grep -qxF "$RULE_FILE" <<<"$files" && in_ours=1
     if [[ "$USE_INCLUDE" -eq 1 ]]; then
         grep -Fqs "${RULE_DIR}/*.conf" "$include_file" 2>/dev/null || include_ok=0
     fi
-    if [[ "$rule_ok" -eq 1 ]]; then
+
+    # Rule exists in some other (already loaded) config -> nothing to do
+    if [[ -n "$others" ]]; then
         ok "Rule ID ${RULE_ID} already exists in system-level ModSecurity configs. No installation needed."
         ALREADY+=("ModSecurity rule ${RULE_ID} already exists")
         return
     fi
+    # Our own rule file exists AND it is included -> nothing to do
+    if [[ "$in_ours" -eq 1 && "$include_ok" -eq 1 ]]; then
+        ok "Rule ID ${RULE_ID} is in ${RULE_FILE} and the include line is in place. No installation needed."
+        ALREADY+=("ModSecurity rule ${RULE_ID} already installed in ${RULE_FILE}")
+        return
+    fi
 
-    [[ "$rule_ok" -eq 0 ]] && warn "Rule ID ${RULE_ID} was not found in system-level ModSecurity configs."
+    [[ "$in_ours" -eq 0 ]] && warn "Rule ID ${RULE_ID} was not found in system-level ModSecurity configs."
     [[ "$include_ok" -eq 0 ]] && warn "Include line for ${RULE_DIR}/*.conf is missing from ${include_file}."
 
     reason "This protects the hosted websites: requests with the php_session_upload_progress field in multipart uploads are blocked with 403, so the related PHP bug cannot be exploited against customer sites. It is checked last, after upcp/ea-php updates, in case they overwrote the config."
@@ -710,10 +723,148 @@ RULES
 }
 
 # =====================================================
+# PHP: disable session.upload_progress.enabled (all versions)
+# =====================================================
+# Prints KEY=VALUE lines describing one PHP binary
+php_query() {
+    "$1" -d display_errors=0 -r '$v = ini_get("session.upload_progress.enabled");
+$f = php_ini_scanned_files();
+echo "VER=" . PHP_VERSION . "\n";
+echo "INI=" . (php_ini_loaded_file() ?: "None") . "\n";
+echo "SCAN=" . (PHP_CONFIG_FILE_SCAN_DIR ?: "None") . "\n";
+echo "UP=" . ($v === false ? "n/a" : ($v === "" ? "0" : $v)) . "\n";
+echo "EXTRA=" . ($f ? trim(str_replace(array("\n", "\r"), " ", $f)) : "None") . "\n";' 2>/dev/null
+}
+
+php_field() { sed -n "s/^$1=//p" <<<"$2" | head -n1; }
+
+# true if the ini value means "enabled"
+php_flag_on() {
+    case "${1,,}" in
+        1|on|true|yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+step_php_upload_progress() {
+    header "PHP session.upload_progress.enabled (all PHP versions)"
+    local -A seen_real=() seen_target=()
+    local -a t_bins=() t_files=() t_modes=()
+    local p real out ver ini scan up extra target mode i
+    local checked=0 changed=0
+
+    for p in /usr/local/php*/bin/php \
+             /usr/local/lsws/lsphp*/bin/php \
+             /opt/cpanel/ea-php*/root/usr/bin/php \
+             /opt/alt/php*/usr/bin/php \
+             /usr/bin/php; do
+        [[ -x "$p" ]] || continue
+        real="$(readlink -f "$p" 2>/dev/null || true)"
+        [[ -n "$real" ]] || real="$p"
+        [[ -n "${seen_real[$real]:-}" ]] && continue
+        seen_real[$real]=1
+
+        out="$(php_query "$p")"
+        if [[ -z "$out" ]]; then
+            warn "Could not query ${p}; skipping."
+            continue
+        fi
+        ver="$(php_field VER "$out")"
+        ini="$(php_field INI "$out")"
+        scan="$(php_field SCAN "$out")"
+        up="$(php_field UP "$out")"
+        extra="$(php_field EXTRA "$out")"
+        checked=$((checked + 1))
+
+        echo "=== $p ==="
+        printf 'Version: %s\nINI: %s\nScan dir: %s\nUpload progress: %s\nExtra INI: %s\n\n' \
+            "$ver" "$ini" "$scan" "$up" "$extra"
+
+        if [[ "$up" == "n/a" ]]; then
+            info "session extension is not loaded in this PHP CLI; skipping."
+            continue
+        fi
+        php_flag_on "$up" || continue   # already off
+
+        if [[ "$scan" != "None" && -d "$scan" ]]; then
+            target="${scan%/}/99-disable-upload-progress.ini"
+            mode="dropin"
+        elif [[ "$ini" != "None" && -f "$ini" ]]; then
+            target="$ini"
+            mode="phpini"
+        else
+            warn "No scan dir or php.ini found for ${p}; cannot change it automatically."
+            FAILED+=("PHP upload_progress (${p}: no ini location)")
+            continue
+        fi
+        [[ -n "${seen_target[$target]:-}" ]] && continue
+        seen_target[$target]=1
+        t_bins+=("$p"); t_files+=("$target"); t_modes+=("$mode")
+    done
+
+    if [[ "$checked" -eq 0 ]]; then
+        info "No PHP binaries found."
+        return
+    fi
+
+    if [[ ${#t_bins[@]} -eq 0 ]]; then
+        ok "No PHP version needs a change (session.upload_progress.enabled is already off or not applicable)."
+        ALREADY+=("session.upload_progress.enabled already off for all checked PHP versions")
+        PHPFPM_SUGGEST=1
+        return
+    fi
+
+    reason "session.upload_progress.enabled lets PHP create session upload-progress data from the php_session_upload_progress field in multipart uploads, the same field the ModSecurity rule blocks. Turning it off removes that feature at the PHP level for every version (a second layer next to the rule). Side effect: apps that show upload progress bars through PHP sessions will stop showing progress."
+    printf 'These PHP versions have it enabled:\n'
+    for i in "${!t_bins[@]}"; do
+        printf '  - %s -> %s (%s)\n' "${t_bins[$i]}" "${t_files[$i]}" "${t_modes[$i]}"
+    done
+    if ! ask "Disable session.upload_progress.enabled for all of them?"; then
+        SKIPPED+=("Disable session.upload_progress.enabled"); return
+    fi
+
+    for i in "${!t_bins[@]}"; do
+        target="${t_files[$i]}"
+        mode="${t_modes[$i]}"
+        if [[ -e "$target" ]] && ! backup_path "$target"; then
+            warn "Backup of ${target} failed. Skipping it."
+            FAILED+=("PHP upload_progress (backup failed: ${target})")
+            continue
+        fi
+        if [[ "$mode" == "dropin" ]]; then
+            printf '; Added by server-hardening.sh\nsession.upload_progress.enabled = Off\n' > "$target" \
+                && chmod 0644 "$target"
+        else
+            if grep -qE '^[[:space:]]*session\.upload_progress\.enabled[[:space:]]*=' "$target"; then
+                sed -i -E 's/^[[:space:]]*session\.upload_progress\.enabled[[:space:]]*=.*/session.upload_progress.enabled = Off/' "$target"
+            else
+                [[ -n "$(tail -c1 "$target" 2>/dev/null)" ]] && echo >> "$target"
+                echo 'session.upload_progress.enabled = Off' >> "$target"
+            fi
+        fi
+
+        out="$(php_query "${t_bins[$i]}")"
+        up="$(php_field UP "$out")"
+        if php_flag_on "$up"; then
+            warn "Still enabled for ${t_bins[$i]} after editing ${target} (overridden by another INI file? check Extra INI)."
+            FAILED+=("PHP upload_progress (still enabled: ${t_bins[$i]})")
+        else
+            ok "Disabled for ${t_bins[$i]} (${target})"
+            changed=1
+        fi
+    done
+
+    if [[ "$changed" -eq 1 ]]; then
+        DONE+=("session.upload_progress.enabled disabled for PHP versions (backups in ${BACKUP_DIR})")
+        PHPFPM_CHANGED=1
+    fi
+}
+
+# =====================================================
 # Restarts
 # =====================================================
 apply_restarts() {
-    if [[ $((RESTART_CSF + RESTART_CPSRVD + RESTART_DA + RESTART_WEB)) -eq 0 ]]; then
+    if [[ $((RESTART_CSF + RESTART_CPSRVD + RESTART_WEB)) -eq 0 ]]; then
         return
     fi
     header "Restarting services (for applied changes)"
@@ -721,19 +872,13 @@ apply_restarts() {
     if [[ "$RESTART_CSF" -eq 1 ]]; then
         reason "CSF must be reloaded so the new port list takes effect."
         if csf -r; then ok "CSF restarted"; else warn "CSF restart failed"; FAILED+=("CSF restart"); fi
-        RESTART_CSF=0; SUGGEST_CSF=0
+        RESTART_CSF=0
     fi
 
     if [[ "$RESTART_CPSRVD" -eq 1 ]]; then
         reason "cpsrvd must be restarted so the feature list and cPanel config changes take effect."
         if /scripts/restartsrv_cpsrvd; then ok "cpsrvd restarted"; else warn "cpsrvd restart failed"; FAILED+=("cpsrvd restart"); fi
         RESTART_CPSRVD=0; SUGGEST_CPSRVD=0
-    fi
-
-    if [[ "$RESTART_DA" -eq 1 ]]; then
-        reason "DirectAdmin is restarted to keep it consistent with the new firewall state."
-        if systemctl restart directadmin; then ok "DirectAdmin restarted"; else warn "DirectAdmin restart failed"; FAILED+=("DirectAdmin restart"); fi
-        RESTART_DA=0; SUGGEST_DA=0
     fi
 
     if [[ "$RESTART_WEB" -eq 1 ]]; then
@@ -763,25 +908,17 @@ apply_restarts() {
 }
 
 precautionary_restart() {
-    if [[ $((SUGGEST_CSF + SUGGEST_CPSRVD + SUGGEST_DA + SUGGEST_WEB)) -eq 0 ]]; then
+    if [[ $((SUGGEST_CPSRVD + SUGGEST_WEB)) -eq 0 ]]; then
         return
     fi
     header "Precautionary restart"
     echo "These steps were already applied earlier. Just to be safe, these services should be restarted:"
-    [[ "$SUGGEST_CSF"    -eq 1 ]] && echo "  - CSF (csf -r)"
     [[ "$SUGGEST_CPSRVD" -eq 1 ]] && echo "  - cPanel (cpsrvd)"
-    [[ "$SUGGEST_DA"     -eq 1 ]] && echo "  - DirectAdmin"
     [[ "$SUGGEST_WEB"    -eq 1 ]] && echo "  - Web server (${SERVICE})"
 
     if ask "Restart them now?"; then
-        if [[ "$SUGGEST_CSF" -eq 1 ]]; then
-            if csf -r; then ok "CSF restarted"; else warn "CSF restart failed"; FAILED+=("CSF restart"); fi
-        fi
         if [[ "$SUGGEST_CPSRVD" -eq 1 ]]; then
             if /scripts/restartsrv_cpsrvd; then ok "cpsrvd restarted"; else warn "cpsrvd restart failed"; FAILED+=("cpsrvd restart"); fi
-        fi
-        if [[ "$SUGGEST_DA" -eq 1 ]]; then
-            if systemctl restart directadmin; then ok "DirectAdmin restarted"; else warn "DirectAdmin restart failed"; FAILED+=("DirectAdmin restart"); fi
         fi
         if [[ "$SUGGEST_WEB" -eq 1 ]]; then
             info "Testing web server configuration before restart..."
@@ -798,87 +935,51 @@ precautionary_restart() {
     fi
 }
 
-# ---------- Alt-PHP security updates (CloudLinux only) ----------
-step_alt_php_cve_check() {
-    local p count missing=0
-    local -a installed_common=() installed_altphp=()
+# =====================================================
+# PHP-FPM restart (very last step; not needed on LiteSpeed)
+# =====================================================
+step_php_fpm_restart() {
+    if [[ "$PHPFPM_CHANGED" -eq 0 && "$PHPFPM_SUGGEST" -eq 0 ]]; then
+        return 0
+    fi
+    header "PHP-FPM restart"
 
-    if [[ ! -f /etc/cloudlinux-release ]] && ! rpm -q cloudlinux-release >/dev/null 2>&1 \
-        && ! grep -qi 'CloudLinux' /etc/redhat-release 2>/dev/null; then
-        info "CloudLinux not detected; skipping Alt-PHP CVE check."
+    if detect_web && [[ "$WEBSERVER" == "LiteSpeed" ]]; then
+        info "LiteSpeed is active: no PHP-FPM restart is needed."
         return 0
     fi
 
-    header "Alt-PHP security check (CloudLinux)"
+    local -a units=()
+    local u
+    mapfile -t units < <(systemctl list-units --type=service --state=running --plain --no-legend --no-pager \
+        'ea-php*-php-fpm.service' 'php-fpm*.service' 'php*-fpm.service' 'alt-php*-fpm.service' 2>/dev/null \
+        | awk '{print $1}' | sort -u)
 
-    mapfile -t installed_common < <(rpm -qa 'alt-php*-common' --qf '%{NAME}\n' | sort -V)
-    if [[ ${#installed_common[@]} -eq 0 ]]; then
-        info "No installed Alt-PHP common packages found; skipping."
+    if [[ ${#units[@]} -eq 0 ]]; then
+        info "No running PHP-FPM services found."
         return 0
     fi
 
-    for p in "${installed_common[@]}"; do
-        count=$(rpm -q --changelog "$p" 2>/dev/null | grep -cE 'CVE-2026-(109618|109619)' || true)
-        if [[ "$count" -gt 0 ]]; then
-            printf '[PATCHED] %s (CVE entries: %s)\n' "$p" "$count"
-        else
-            printf '[CHECK]   %s (CVE entries not found)\n' "$p"
-            missing=1
-        fi
-    done
-
-    if [[ "$missing" -eq 0 ]]; then
-        ALREADY+=("Installed Alt-PHP packages list the relevant CVEs in changelog")
-        return 0
-    fi
-
-    mapfile -t installed_altphp < <(rpm -qa 'alt-php*' --qf '%{NAME}\n' | sort -u)
-    if [[ ${#installed_altphp[@]} -eq 0 ]]; then
-        info "No installed Alt-PHP packages found to update."
-        return 0
-    fi
-
-    reason "One or more installed Alt-PHP common packages do not list the relevant CVEs in their changelog. Attempting to update installed Alt-PHP packages only; yum will resolve required dependencies."
-    if ! command -v yum >/dev/null 2>&1; then
-        warn "yum is unavailable; Alt-PHP packages were not updated."
-        FAILED+=("Alt-PHP security update (yum unavailable)")
-        return 0
-    fi
-
-    printf '\nThe following installed Alt-PHP packages will be checked for updates, along with required dependencies:\n'
-    printf '  %s\n' "${installed_altphp[@]}"
-    if ! ask "Proceed with yum update for these packages?"; then
-        info "Alt-PHP update declined; no packages were changed."
-        SKIPPED+=("Alt-PHP security update (declined)")
-        return 0
-    fi
-
-    info "Updating installed Alt-PHP packages and required dependencies..."
-    if yum update "${installed_altphp[@]}"; then
-        DONE+=("Attempted Alt-PHP security update")
+    if [[ "$PHPFPM_CHANGED" -eq 1 ]]; then
+        reason "PHP-FPM reads php.ini only at start, so the session.upload_progress.enabled change takes effect after a restart."
     else
-        warn "yum update failed for installed Alt-PHP packages."
-        FAILED+=("Alt-PHP security update")
+        reason "session.upload_progress.enabled was already off. Restarting PHP-FPM is only a precaution, to be sure running pools use the current php.ini."
     fi
-
-    missing=0
-    for p in "${installed_common[@]}"; do
-        if ! rpm -q "$p" >/dev/null 2>&1; then
-            continue
-        fi
-        count=$(rpm -q --changelog "$p" 2>/dev/null | grep -cE 'CVE-2026-(109618|109619)' || true)
-        if [[ "$count" -gt 0 ]]; then
-            printf '[PATCHED] %s (CVE entries: %s)\n' "$p" "$count"
+    echo "Running PHP-FPM services:"
+    printf '  - %s\n' "${units[@]}"
+    if ! ask "Restart these PHP-FPM services now?"; then
+        SKIPPED+=("PHP-FPM restart")
+        return 0
+    fi
+    for u in "${units[@]}"; do
+        if systemctl restart "$u"; then
+            ok "${u} restarted"
         else
-            printf '[CHECK]   %s (CVE entries still not found after update)\n' "$p"
-            missing=1
+            warn "${u} restart failed"
+            FAILED+=("${u} restart")
         fi
     done
-
-    if [[ "$missing" -eq 1 ]]; then
-        warn "Some installed Alt-PHP packages still do not list the CVEs in their changelog; verify their CloudLinux security advisory/package versions."
-        FAILED+=("Alt-PHP CVE status requires verification")
-    fi
+    DONE+=("PHP-FPM services restarted")
 }
 
 # ---------- Run steps ----------
@@ -901,7 +1002,10 @@ fi
 
 step_alt_php_cve_check
 
-# Restart services for changes made so far (cpsrvd, CSF, DA, web after ea-php)
+# Disable session.upload_progress.enabled in every PHP version
+step_php_upload_progress
+
+# Restart services for changes made so far (cpsrvd, CSF, web after ea-php)
 apply_restarts
 
 # ModSecurity rule check is LAST, so it is re-added if updates overwrote it
@@ -910,6 +1014,9 @@ apply_restarts
 
 # Precautionary restarts for steps that were already applied earlier
 precautionary_restart
+
+# PHP-FPM restart is the very last action (skipped on LiteSpeed)
+step_php_fpm_restart
 
 # ---------- Summary ----------
 header "Summary"
