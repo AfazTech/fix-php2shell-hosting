@@ -12,13 +12,17 @@ RULE_ID="501500"
 RULE_DIR="/etc/custom_modsecurity.d"
 RULE_FILE="${RULE_DIR}/infraguard.conf"
 CUSTOMBUILD="/usr/local/directadmin/custombuild"
+UPCP="/usr/local/cpanel/scripts/upcp"
+
+MIN_PHP_VER="8.4.27"
+MIN_CPANEL_MAJOR="138"
 
 DONE=()
 ALREADY=()
 SKIPPED=()
 FAILED=()
 
-# Restarts needed because we changed something (already confirmed by the user)
+# Restarts needed because we changed something
 RESTART_WEB=0
 RESTART_CPSRVD=0
 RESTART_DA=0
@@ -30,9 +34,14 @@ SUGGEST_CPSRVD=0
 SUGGEST_DA=0
 SUGGEST_CSF=0
 
+WEB_RESTARTED=0
 MODSEC_INCLUDE_FILE=""
 USE_INCLUDE=1
 RULE_EXISTED=0
+MODSEC_CHANGED=0
+
+# cPanel update status: 1 = updated, 0 = not updated / unknown
+CP_UPDATED=0
 
 info()   { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 reason() { printf '\033[1;33m[WHY]\033[0m  %s\n' "$*"; }
@@ -59,6 +68,11 @@ backup_path() {
     local src="$1"
     [[ -e "$src" ]] || return 0
     mkdir -p "$BACKUP_DIR" && cp -a --parents "$src" "$BACKUP_DIR/"
+}
+
+# ver_ge A B  ->  true if A >= B (version compare)
+ver_ge() {
+    [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]
 }
 
 # ---------- Detect control panel ----------
@@ -92,7 +106,7 @@ detect_web() {
 # Is the Apache ModSecurity module loaded?
 modsec_loaded() {
     local bin
-    for bin in httpd apachectl apache2ctl; do
+    for bin in httpd apachectl apache2ctl /usr/local/apache/bin/httpd; do
         if command -v "$bin" >/dev/null 2>&1; then
             "$bin" -M 2>/dev/null | grep -qi 'security2_module' && return 0
         fi
@@ -117,7 +131,136 @@ info "Detected control panel: ${PANEL}"
 info "Backup directory: ${BACKUP_DIR}"
 
 # =====================================================
-# cPanel: disable phpMyAdmin
+# cPanel: check whether the security update is applied
+# =====================================================
+check_cpanel_update() {
+    header "Check cPanel / PHP update status"
+    local phpbin="/usr/local/cpanel/3rdparty/bin/php"
+    local phpver="" cpver="" cpnum="" cpmajor=""
+
+    if [[ -x "$phpbin" ]]; then
+        phpver="$("$phpbin" -r 'echo PHP_VERSION;' 2>/dev/null || true)"
+    fi
+    if [[ -x /usr/local/cpanel/cpanel ]]; then
+        cpver="$(/usr/local/cpanel/cpanel -V 2>/dev/null | head -n1 || true)"
+    fi
+    cpnum="$(awk '{print $1}' <<<"$cpver")"
+    cpmajor="${cpnum%%.*}"
+
+    printf 'cPanel PHP: %s\ncPanel: %s\n' "${phpver:-unknown}" "${cpver:-unknown}"
+
+    CP_UPDATED=0
+    if [[ -z "$phpver" || ! "$cpmajor" =~ ^[0-9]+$ ]]; then
+        warn "Could not determine PHP/cPanel version. Treating as NOT updated."
+        return
+    fi
+
+    if ver_ge "$phpver" "$MIN_PHP_VER" && [[ "$cpmajor" -ge "$MIN_CPANEL_MAJOR" ]]; then
+        CP_UPDATED=1
+        ok "PHP ${phpver} >= ${MIN_PHP_VER} and cPanel ${cpnum} >= ${MIN_CPANEL_MAJOR}.0: update looks applied (still verify the build includes the CVE fixes)."
+    else
+        alarm "CHECK REQUIRED: PHP is below ${MIN_PHP_VER} or cPanel is below ${MIN_CPANEL_MAJOR}.0. The server is NOT updated."
+    fi
+}
+
+# =====================================================
+# cPanel: run upcp if not updated
+# =====================================================
+step_upcp() {
+    header "Update cPanel (upcp)"
+    if [[ ! -x "$UPCP" ]]; then
+        warn "${UPCP} not found or not executable."
+        FAILED+=("cPanel update (upcp not found)"); return
+    fi
+    reason "cPanel or its bundled PHP is below the required version. upcp updates cPanel and its PHP. It can take a long time, so run this script inside screen/tmux if your SSH is unstable."
+    if ! ask "Run ${UPCP} now?"; then
+        SKIPPED+=("cPanel update (upcp)"); return
+    fi
+    info "Running: ${UPCP}"
+    if "$UPCP"; then
+        DONE+=("upcp finished")
+    else
+        warn "upcp returned an error."
+        FAILED+=("upcp (returned error)")
+    fi
+    check_cpanel_update
+    if [[ "$CP_UPDATED" -eq 0 ]]; then
+        warn "Still below the required version after upcp. Check the update tier in /etc/cpupdate.conf and /var/cpanel/updatelogs/."
+    fi
+}
+
+# =====================================================
+# cPanel: EasyApache PHP versions (ea-php*)
+# =====================================================
+step_ea_php() {
+    header "Check EasyApache PHP versions (ea-php*)"
+    local bin found=0 pm="" out="" rc=0
+
+    for bin in /opt/cpanel/ea-php*/root/usr/bin/php; do
+        [[ -x "$bin" ]] || continue
+        found=1
+        printf '%s: ' "$bin"
+        "$bin" -v 2>/dev/null | head -n1
+    done
+    if [[ "$found" -eq 0 ]]; then
+        info "No ea-php installation found."
+        return
+    fi
+
+    if command -v yum >/dev/null 2>&1; then
+        pm="yum"
+    elif command -v dnf >/dev/null 2>&1; then
+        pm="dnf"
+    else
+        warn "Neither yum nor dnf found."
+        FAILED+=("ea-php check (no package manager)"); return
+    fi
+
+    info "Checking: ${pm} check-update 'ea-php*'"
+    out="$("$pm" -q check-update 'ea-php*' 2>&1)"; rc=$?
+    case "$rc" in
+        0)
+            ok "No pending ea-php updates."
+            ALREADY+=("ea-php packages already up to date")
+            return ;;
+        100)
+            printf '%s\n' "$out" ;;
+        *)
+            printf '%s\n' "$out"
+            warn "Could not check ea-php updates (exit code ${rc})."
+            FAILED+=("ea-php check (check-update failed)"); return ;;
+    esac
+
+    reason "Updates are available for ea-php packages. Updating them installs the latest security fixes for every PHP version used by customer sites."
+    if ! ask "Run '${pm} update ea-php*' now?"; then
+        SKIPPED+=("ea-php update"); return
+    fi
+
+    backup_path /etc/cpanel/ea4 || warn "Backup of /etc/cpanel/ea4 failed (continuing)."
+    info "Running: ${pm} update 'ea-php*'  (type y at the ${pm} prompt)"
+    "$pm" update 'ea-php*'
+
+    "$pm" -q check-update 'ea-php*' >/dev/null 2>&1; rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        ok "ea-php packages are now up to date."
+        DONE+=("ea-php packages updated")
+        RESTART_WEB=1
+        for bin in /opt/cpanel/ea-php*/root/usr/bin/php; do
+            [[ -x "$bin" ]] || continue
+            printf '%s: ' "$bin"
+            "$bin" -v 2>/dev/null | head -n1
+        done
+    elif [[ "$rc" -eq 100 ]]; then
+        warn "ea-php updates are still pending (update was cancelled or incomplete)."
+        SKIPPED+=("ea-php update (not completed)")
+    else
+        warn "Could not verify ea-php state after update (exit code ${rc})."
+        FAILED+=("ea-php update (verification failed)")
+    fi
+}
+
+# =====================================================
+# cPanel: phpMyAdmin (close / reopen)
 # =====================================================
 phpmyadmin_already() {
     local f count=0
@@ -129,6 +272,15 @@ phpmyadmin_already() {
     [[ "$count" -gt 0 ]]
 }
 
+phpmyadmin_any_closed() {
+    local f
+    for f in /var/cpanel/features/*; do
+        [[ -f "$f" ]] || continue
+        grep -q '^phpmyadmin=0[[:space:]]*$' "$f" && return 0
+    done
+    return 1
+}
+
 step_phpmyadmin() {
     header "Disable phpMyAdmin (cPanel feature lists)"
     if phpmyadmin_already; then
@@ -137,7 +289,7 @@ step_phpmyadmin() {
         SUGGEST_CPSRVD=1
         return
     fi
-    reason "phpMyAdmin is written in PHP, so any PHP bug becomes a risk to the server. Setting it to 0 in every feature list removes it for all accounts."
+    reason "The server is not updated. phpMyAdmin is written in PHP, so any PHP bug becomes a risk to the server. Setting it to 0 in every feature list removes it for all accounts."
     if ! ask "Disable phpMyAdmin in all feature lists?"; then
         SKIPPED+=("Disable phpMyAdmin"); return
     fi
@@ -162,8 +314,35 @@ step_phpmyadmin() {
     RESTART_CPSRVD=1
 }
 
+step_phpmyadmin_open() {
+    header "Re-enable phpMyAdmin (cPanel feature lists)"
+    if ! phpmyadmin_any_closed; then
+        ok "phpMyAdmin is not disabled in any feature list. Nothing to reopen."
+        ALREADY+=("phpMyAdmin already enabled (no feature list has phpmyadmin=0)")
+        return
+    fi
+    reason "The server is updated, and phpMyAdmin is currently closed in some feature lists. Reopening it restores the normal service for customers."
+    if ! ask "Re-enable phpMyAdmin (phpmyadmin=1 where it is 0)?"; then
+        SKIPPED+=("Re-enable phpMyAdmin"); return
+    fi
+    info "Backing up /var/cpanel/features ..."
+    if ! backup_path /var/cpanel/features; then
+        warn "Backup failed. No changes made."
+        FAILED+=("phpMyAdmin reopen (backup failed)"); return
+    fi
+    local f
+    for f in /var/cpanel/features/*; do
+        [[ -f "$f" ]] || continue
+        sed -i 's/^phpmyadmin=0[[:space:]]*$/phpmyadmin=1/' "$f"
+    done
+    info "Verification:"
+    grep -Hn '^phpmyadmin=' /var/cpanel/features/* || true
+    DONE+=("phpmyadmin=1 restored in cPanel feature lists")
+    RESTART_CPSRVD=1
+}
+
 # =====================================================
-# cPanel: disable Roundcube
+# cPanel: Roundcube (close / reopen)
 # =====================================================
 step_roundcube() {
     header "Disable Roundcube (cPanel)"
@@ -178,7 +357,7 @@ step_roundcube() {
         SUGGEST_CPSRVD=1
         return
     fi
-    reason "Roundcube is written in PHP too, so it has the same exposure to PHP bugs. skiproundcube=1 disables it server-wide."
+    reason "The server is not updated. Roundcube is written in PHP too, so it has the same exposure to PHP bugs. skiproundcube=1 disables it server-wide."
     if ! ask "Disable Roundcube?"; then
         SKIPPED+=("Disable Roundcube"); return
     fi
@@ -194,6 +373,32 @@ step_roundcube() {
     fi
     grep -n '^skiproundcube=' "$cfg" || true
     DONE+=("skiproundcube=1 set in cpanel.config")
+    RESTART_CPSRVD=1
+}
+
+step_roundcube_open() {
+    header "Re-enable Roundcube (cPanel)"
+    local cfg="/var/cpanel/cpanel.config"
+    if [[ ! -f "$cfg" ]]; then
+        warn "${cfg} not found."
+        FAILED+=("Roundcube reopen (config file missing)"); return
+    fi
+    if ! grep -q '^skiproundcube=1[[:space:]]*$' "$cfg"; then
+        ok "Roundcube is not disabled. Nothing to reopen."
+        ALREADY+=("Roundcube already enabled (skiproundcube is not 1)")
+        return
+    fi
+    reason "The server is updated, and Roundcube is currently closed (skiproundcube=1). Reopening it restores webmail for customers."
+    if ! ask "Re-enable Roundcube (skiproundcube=0)?"; then
+        SKIPPED+=("Re-enable Roundcube"); return
+    fi
+    if ! backup_path "$cfg"; then
+        warn "Backup failed. No changes made."
+        FAILED+=("Roundcube reopen (backup failed)"); return
+    fi
+    sed -i 's/^skiproundcube=.*/skiproundcube=0/' "$cfg"
+    grep -n '^skiproundcube=' "$cfg" || true
+    DONE+=("skiproundcube=0 set in cpanel.config")
     RESTART_CPSRVD=1
 }
 
@@ -361,7 +566,7 @@ ensure_modsec() {
 }
 
 # =====================================================
-# ModSecurity rule (both panels)
+# ModSecurity rule (both panels, runs LAST, updated or not)
 # =====================================================
 modsec_rollback() {
     warn "Restoring ModSecurity files from backup..."
@@ -376,7 +581,7 @@ modsec_rollback() {
 }
 
 step_modsec() {
-    header "Install ModSecurity rule (php_session_upload_progress)"
+    header "Final check: ModSecurity rule (php_session_upload_progress)"
 
     if ! detect_web; then
         warn "No active web server found."
@@ -411,12 +616,15 @@ step_modsec() {
     if [[ "$module_ok" -eq 1 && "$rule_ok" -eq 1 && "$include_ok" -eq 1 ]]; then
         ok "Already done: ModSecurity is loaded and rule ${RULE_ID} is in place (${RULE_FILE})."
         ALREADY+=("ModSecurity rule ${RULE_ID} already installed in ${RULE_FILE}")
-        SUGGEST_WEB=1
+        [[ "$WEB_RESTARTED" -eq 0 ]] && SUGGEST_WEB=1
         return
     fi
 
-    reason "This protects the hosted websites: requests with the php_session_upload_progress field in multipart uploads are blocked with 403, so the related PHP bug cannot be exploited against customer sites."
-    if ! ask "Install the ModSecurity rule?"; then
+    [[ "$rule_ok" -eq 0 ]] && warn "Rule ${RULE_ID} is missing from ${RULE_FILE} (never installed, or overwritten by an update)."
+    [[ "$include_ok" -eq 0 ]] && warn "Include line for ${RULE_DIR}/*.conf is missing from ${include_file}."
+
+    reason "This protects the hosted websites: requests with the php_session_upload_progress field in multipart uploads are blocked with 403, so the related PHP bug cannot be exploited against customer sites. It is checked last, after upcp/ea-php updates, in case they overwrote the config."
+    if ! ask "Install/restore the ModSecurity rule?"; then
         SKIPPED+=("ModSecurity rule"); return
     fi
 
@@ -461,6 +669,7 @@ step_modsec() {
         FAILED+=("ModSecurity (backup failed)"); return
     fi
 
+    MODSEC_CHANGED=1
     mkdir -p "$RULE_DIR" && chmod 0755 "$RULE_DIR"
 
     if ! grep -q "id:${RULE_ID}" "$RULE_FILE" 2>/dev/null; then
@@ -478,6 +687,7 @@ RULES
 
     if ! get_test_cmd; then
         modsec_rollback
+        MODSEC_CHANGED=0
         warn "No Apache-compatible config test tool found."
         FAILED+=("ModSecurity (cannot test config)"); return
     fi
@@ -485,67 +695,72 @@ RULES
     info "Testing configuration..."
     if ! "${TEST_CMD[@]}"; then
         modsec_rollback
+        MODSEC_CHANGED=0
         warn "Config test failed. Files restored."
         FAILED+=("ModSecurity (config test failed)"); return
     fi
 
-    DONE+=("ModSecurity rule ${RULE_ID} installed in ${RULE_FILE}")
+    DONE+=("ModSecurity rule ${RULE_ID} installed/restored in ${RULE_FILE}")
     RESTART_WEB=1
 }
 
-# ---------- Run steps ----------
-if [[ "$PANEL" == "cpanel" ]]; then
-    step_phpmyadmin
-    step_roundcube
-else
-    step_csf_da_port
-fi
-step_modsec
-
-# ---------- Restarts for changes we made ----------
-header "Restarting services (for applied changes)"
-ANY_RESTART=0
-
-if [[ "$RESTART_CSF" -eq 1 ]]; then
-    ANY_RESTART=1
-    reason "CSF must be reloaded so the new port list takes effect."
-    if csf -r; then ok "CSF restarted"; else warn "CSF restart failed"; FAILED+=("CSF restart"); fi
-fi
-
-if [[ "$RESTART_CPSRVD" -eq 1 ]]; then
-    ANY_RESTART=1
-    reason "cpsrvd must be restarted so the feature list and cPanel config changes take effect."
-    if /scripts/restartsrv_cpsrvd; then ok "cpsrvd restarted"; else warn "cpsrvd restart failed"; FAILED+=("cpsrvd restart"); fi
-fi
-
-if [[ "$RESTART_DA" -eq 1 ]]; then
-    ANY_RESTART=1
-    reason "DirectAdmin is restarted to keep it consistent with the new firewall state."
-    if systemctl restart directadmin; then ok "DirectAdmin restarted"; else warn "DirectAdmin restart failed"; FAILED+=("DirectAdmin restart"); fi
-fi
-
-if [[ "$RESTART_WEB" -eq 1 ]]; then
-    ANY_RESTART=1
-    reason "The web server (${SERVICE}) must be restarted to load the ModSecurity module/rule."
-    if systemctl restart "$SERVICE"; then
-        ok "${WEBSERVER} restarted"
-    else
-        warn "Restart of ${SERVICE} failed. Rolling back the ModSecurity rule..."
-        modsec_rollback
-        systemctl restart "$SERVICE" || true
-        FAILED+=("${SERVICE} restart (ModSecurity rule rolled back)")
+# =====================================================
+# Restarts
+# =====================================================
+apply_restarts() {
+    if [[ $((RESTART_CSF + RESTART_CPSRVD + RESTART_DA + RESTART_WEB)) -eq 0 ]]; then
+        return
     fi
-fi
-[[ "$ANY_RESTART" -eq 0 ]] && info "Nothing was changed, no restart needed for applied changes."
+    header "Restarting services (for applied changes)"
 
-# ---------- Precautionary restarts for already-applied steps ----------
-# Skip services that were already restarted above
-[[ "$RESTART_CSF"    -eq 1 ]] && SUGGEST_CSF=0
-[[ "$RESTART_CPSRVD" -eq 1 ]] && SUGGEST_CPSRVD=0
-[[ "$RESTART_DA"     -eq 1 ]] && SUGGEST_DA=0
-[[ "$RESTART_WEB"    -eq 1 ]] && SUGGEST_WEB=0
+    if [[ "$RESTART_CSF" -eq 1 ]]; then
+        reason "CSF must be reloaded so the new port list takes effect."
+        if csf -r; then ok "CSF restarted"; else warn "CSF restart failed"; FAILED+=("CSF restart"); fi
+        RESTART_CSF=0; SUGGEST_CSF=0
+    fi
 
-if [[ $((SUGGEST_CSF + SUGGEST_CPSRVD + SUGGEST_DA + SUGGEST_WEB)) -gt 0 ]]; then
+    if [[ "$RESTART_CPSRVD" -eq 1 ]]; then
+        reason "cpsrvd must be restarted so the feature list and cPanel config changes take effect."
+        if /scripts/restartsrv_cpsrvd; then ok "cpsrvd restarted"; else warn "cpsrvd restart failed"; FAILED+=("cpsrvd restart"); fi
+        RESTART_CPSRVD=0; SUGGEST_CPSRVD=0
+    fi
+
+    if [[ "$RESTART_DA" -eq 1 ]]; then
+        reason "DirectAdmin is restarted to keep it consistent with the new firewall state."
+        if systemctl restart directadmin; then ok "DirectAdmin restarted"; else warn "DirectAdmin restart failed"; FAILED+=("DirectAdmin restart"); fi
+        RESTART_DA=0; SUGGEST_DA=0
+    fi
+
+    if [[ "$RESTART_WEB" -eq 1 ]]; then
+        if ! detect_web; then
+            warn "No active web server found; cannot restart."
+            FAILED+=("Web server restart (no active web server)")
+        else
+            reason "The web server (${SERVICE}) must be restarted to load updated PHP packages and/or the ModSecurity module/rule."
+            if systemctl restart "$SERVICE"; then
+                ok "${WEBSERVER} restarted"
+                WEB_RESTARTED=1
+            else
+                warn "Restart of ${SERVICE} failed."
+                if [[ "$MODSEC_CHANGED" -eq 1 ]]; then
+                    warn "Rolling back the ModSecurity rule..."
+                    modsec_rollback
+                    MODSEC_CHANGED=0
+                    FAILED+=("${SERVICE} restart (ModSecurity rule rolled back)")
+                else
+                    FAILED+=("${SERVICE} restart")
+                fi
+                systemctl restart "$SERVICE" || true
+            fi
+        fi
+        RESTART_WEB=0; SUGGEST_WEB=0
+    fi
+}
+
+precautionary_restart() {
+    if [[ $((SUGGEST_CSF + SUGGEST_CPSRVD + SUGGEST_DA + SUGGEST_WEB)) -eq 0 ]]; then
+        return
+    fi
     header "Precautionary restart"
     echo "These steps were already applied earlier. Just to be safe, these services should be restarted:"
     [[ "$SUGGEST_CSF"    -eq 1 ]] && echo "  - CSF (csf -r)"
@@ -565,22 +780,53 @@ if [[ $((SUGGEST_CSF + SUGGEST_CPSRVD + SUGGEST_DA + SUGGEST_WEB)) -gt 0 ]]; the
         fi
         if [[ "$SUGGEST_WEB" -eq 1 ]]; then
             info "Testing web server configuration before restart..."
-            if get_test_cmd && "${TEST_CMD[@]}"; then
+            if detect_web && get_test_cmd && "${TEST_CMD[@]}"; then
                 if systemctl restart "$SERVICE"; then ok "${WEBSERVER} restarted"; else warn "${SERVICE} restart failed"; FAILED+=("${SERVICE} restart"); fi
             else
                 warn "Config test failed or unavailable; web server was NOT restarted."
-                FAILED+=("${SERVICE} restart skipped (config test failed)")
+                FAILED+=("Web server restart skipped (config test failed)")
             fi
         fi
         DONE+=("Precautionary restart of services")
     else
         SKIPPED+=("Precautionary restart of services")
     fi
+}
+
+# ---------- Run steps ----------
+if [[ "$PANEL" == "cpanel" ]]; then
+    check_cpanel_update
+    if [[ "$CP_UPDATED" -eq 0 ]]; then
+        step_upcp
+    fi
+    step_ea_php
+    if [[ "$CP_UPDATED" -eq 1 ]]; then
+        step_phpmyadmin_open
+        step_roundcube_open
+    else
+        step_phpmyadmin
+        step_roundcube
+    fi
+else
+    step_csf_da_port
 fi
+
+# Restart services for changes made so far (cpsrvd, CSF, DA, web after ea-php)
+apply_restarts
+
+# ModSecurity rule check is LAST, so it is re-added if updates overwrote it
+step_modsec
+apply_restarts
+
+# Precautionary restarts for steps that were already applied earlier
+precautionary_restart
 
 # ---------- Summary ----------
 header "Summary"
 echo "Control panel: ${PANEL}"
+if [[ "$PANEL" == "cpanel" ]]; then
+    if [[ "$CP_UPDATED" -eq 1 ]]; then echo "Update status: updated"; else echo "Update status: NOT updated / unknown"; fi
+fi
 echo "Backups:       ${BACKUP_DIR}"
 echo
 echo "Done:"
