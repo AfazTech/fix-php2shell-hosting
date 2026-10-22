@@ -606,11 +606,12 @@ step_modsec() {
     [[ "$USE_INCLUDE" -eq 1 ]] && MODSEC_INCLUDE_FILE="$include_file"
     info "Rule file: ${RULE_FILE}"
 
-    # ---- Already applied? (rule ID exists in a system-level ModSecurity config) ----
+    # ---- Check whether the rule ID already exists in system-level configs ----
     local module_ok=0 rule_ok=0 include_ok=1
     if [[ "$WEBSERVER" == "LiteSpeed" ]] || modsec_loaded; then module_ok=1; fi
-    if grep -Rqs --include='*.conf' --include='*.rules' \
-        --exclude='*.bak.*' "id:${RULE_ID}" \
+    if grep -RqsE --include='*.conf' --include='*.rules' \
+        --exclude='*.bak.*' \
+        "id:[[:space:]]*['\"]?${RULE_ID}(['\",[:space:]]|$)" \
         /etc/httpd/conf /etc/apache2/conf.d /etc/modsecurity.d /etc/custom_modsecurity.d \
         /usr/local/directadmin/data/admin 2>/dev/null; then
         rule_ok=1
@@ -619,12 +620,12 @@ step_modsec() {
         grep -Fqs "${RULE_DIR}/*.conf" "$include_file" 2>/dev/null || include_ok=0
     fi
     if [[ "$rule_ok" -eq 1 ]]; then
-        ok "Rule ID ${RULE_ID} already exists. No installation needed."
+        ok "Rule ID ${RULE_ID} already exists in system-level ModSecurity configs. No installation needed."
         ALREADY+=("ModSecurity rule ${RULE_ID} already exists")
         return
     fi
 
-    [[ "$rule_ok" -eq 0 ]] && warn "Rule ${RULE_ID} is missing from system-level ModSecurity configuration."
+    [[ "$rule_ok" -eq 0 ]] && warn "Rule ID ${RULE_ID} was not found in system-level ModSecurity configs."
     [[ "$include_ok" -eq 0 ]] && warn "Include line for ${RULE_DIR}/*.conf is missing from ${include_file}."
 
     reason "This protects the hosted websites: requests with the php_session_upload_progress field in multipart uploads are blocked with 403, so the related PHP bug cannot be exploited against customer sites. It is checked last, after upcp/ea-php updates, in case they overwrote the config."
@@ -797,6 +798,89 @@ precautionary_restart() {
     fi
 }
 
+# ---------- Alt-PHP security updates (CloudLinux only) ----------
+step_alt_php_cve_check() {
+    local p count missing=0
+    local -a installed_common=() installed_altphp=()
+
+    if [[ ! -f /etc/cloudlinux-release ]] && ! rpm -q cloudlinux-release >/dev/null 2>&1 \
+        && ! grep -qi 'CloudLinux' /etc/redhat-release 2>/dev/null; then
+        info "CloudLinux not detected; skipping Alt-PHP CVE check."
+        return 0
+    fi
+
+    header "Alt-PHP security check (CloudLinux)"
+
+    mapfile -t installed_common < <(rpm -qa 'alt-php*-common' --qf '%{NAME}\n' | sort -V)
+    if [[ ${#installed_common[@]} -eq 0 ]]; then
+        info "No installed Alt-PHP common packages found; skipping."
+        return 0
+    fi
+
+    for p in "${installed_common[@]}"; do
+        count=$(rpm -q --changelog "$p" 2>/dev/null | grep -cE 'CVE-2026-(109618|109619)' || true)
+        if [[ "$count" -gt 0 ]]; then
+            printf '[PATCHED] %s (CVE entries: %s)\n' "$p" "$count"
+        else
+            printf '[CHECK]   %s (CVE entries not found)\n' "$p"
+            missing=1
+        fi
+    done
+
+    if [[ "$missing" -eq 0 ]]; then
+        ALREADY+=("Installed Alt-PHP packages list the relevant CVEs in changelog")
+        return 0
+    fi
+
+    mapfile -t installed_altphp < <(rpm -qa 'alt-php*' --qf '%{NAME}\n' | sort -u)
+    if [[ ${#installed_altphp[@]} -eq 0 ]]; then
+        info "No installed Alt-PHP packages found to update."
+        return 0
+    fi
+
+    reason "One or more installed Alt-PHP common packages do not list the relevant CVEs in their changelog. Attempting to update installed Alt-PHP packages only; yum will resolve required dependencies."
+    if ! command -v yum >/dev/null 2>&1; then
+        warn "yum is unavailable; Alt-PHP packages were not updated."
+        FAILED+=("Alt-PHP security update (yum unavailable)")
+        return 0
+    fi
+
+    printf '\nThe following installed Alt-PHP packages will be checked for updates, along with required dependencies:\n'
+    printf '  %s\n' "${installed_altphp[@]}"
+    if ! ask "Proceed with yum update for these packages?"; then
+        info "Alt-PHP update declined; no packages were changed."
+        SKIPPED+=("Alt-PHP security update (declined)")
+        return 0
+    fi
+
+    info "Updating installed Alt-PHP packages and required dependencies..."
+    if yum update "${installed_altphp[@]}"; then
+        DONE+=("Attempted Alt-PHP security update")
+    else
+        warn "yum update failed for installed Alt-PHP packages."
+        FAILED+=("Alt-PHP security update")
+    fi
+
+    missing=0
+    for p in "${installed_common[@]}"; do
+        if ! rpm -q "$p" >/dev/null 2>&1; then
+            continue
+        fi
+        count=$(rpm -q --changelog "$p" 2>/dev/null | grep -cE 'CVE-2026-(109618|109619)' || true)
+        if [[ "$count" -gt 0 ]]; then
+            printf '[PATCHED] %s (CVE entries: %s)\n' "$p" "$count"
+        else
+            printf '[CHECK]   %s (CVE entries still not found after update)\n' "$p"
+            missing=1
+        fi
+    done
+
+    if [[ "$missing" -eq 1 ]]; then
+        warn "Some installed Alt-PHP packages still do not list the CVEs in their changelog; verify their CloudLinux security advisory/package versions."
+        FAILED+=("Alt-PHP CVE status requires verification")
+    fi
+}
+
 # ---------- Run steps ----------
 if [[ "$PANEL" == "cpanel" ]]; then
     check_cpanel_update
@@ -814,6 +898,8 @@ if [[ "$PANEL" == "cpanel" ]]; then
 else
     step_csf_da_port
 fi
+
+step_alt_php_cve_check
 
 # Restart services for changes made so far (cpsrvd, CSF, DA, web after ea-php)
 apply_restarts
