@@ -606,21 +606,25 @@ step_modsec() {
     [[ "$USE_INCLUDE" -eq 1 ]] && MODSEC_INCLUDE_FILE="$include_file"
     info "Rule file: ${RULE_FILE}"
 
-    # ---- Already applied? (module + rule file + include) ----
+    # ---- Already applied? (rule ID exists in a system-level ModSecurity config) ----
     local module_ok=0 rule_ok=0 include_ok=1
     if [[ "$WEBSERVER" == "LiteSpeed" ]] || modsec_loaded; then module_ok=1; fi
-    grep -qs "id:${RULE_ID}" "$RULE_FILE" 2>/dev/null && rule_ok=1
+    if grep -Rqs --include='*.conf' --include='*.rules' \
+        --exclude='*.bak.*' "id:${RULE_ID}" \
+        /etc/httpd/conf /etc/apache2/conf.d /etc/modsecurity.d /etc/custom_modsecurity.d \
+        /usr/local/directadmin/data/admin 2>/dev/null; then
+        rule_ok=1
+    fi
     if [[ "$USE_INCLUDE" -eq 1 ]]; then
         grep -Fqs "${RULE_DIR}/*.conf" "$include_file" 2>/dev/null || include_ok=0
     fi
-    if [[ "$module_ok" -eq 1 && "$rule_ok" -eq 1 && "$include_ok" -eq 1 ]]; then
-        ok "Already done: ModSecurity is loaded and rule ${RULE_ID} is in place (${RULE_FILE})."
-        ALREADY+=("ModSecurity rule ${RULE_ID} already installed in ${RULE_FILE}")
-        [[ "$WEB_RESTARTED" -eq 0 ]] && SUGGEST_WEB=1
+    if [[ "$rule_ok" -eq 1 ]]; then
+        ok "Rule ID ${RULE_ID} already exists. No installation needed."
+        ALREADY+=("ModSecurity rule ${RULE_ID} already exists")
         return
     fi
 
-    [[ "$rule_ok" -eq 0 ]] && warn "Rule ${RULE_ID} is missing from ${RULE_FILE} (never installed, or overwritten by an update)."
+    [[ "$rule_ok" -eq 0 ]] && warn "Rule ${RULE_ID} is missing from system-level ModSecurity configuration."
     [[ "$include_ok" -eq 0 ]] && warn "Include line for ${RULE_DIR}/*.conf is missing from ${include_file}."
 
     reason "This protects the hosted websites: requests with the php_session_upload_progress field in multipart uploads are blocked with 403, so the related PHP bug cannot be exploited against customer sites. It is checked last, after upcp/ea-php updates, in case they overwrote the config."
@@ -649,7 +653,7 @@ step_modsec() {
     dups="$(grep -Rns --include='*.conf' --include='*.rules' \
         --exclude='*.bak.*' \
         "id:${RULE_ID}" /etc/httpd/conf /etc/apache2/conf.d /etc/modsecurity.d /etc/custom_modsecurity.d \
-        /usr/local/directadmin/data/admin /usr/local/directadmin/data/users \
+        /usr/local/directadmin/data/admin \
         2>/dev/null | grep -v "^${RULE_FILE}:" || true)"
     if [[ -n "$dups" ]]; then
         printf '%s\n' "$dups"
